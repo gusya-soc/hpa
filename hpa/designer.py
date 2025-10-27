@@ -1,3 +1,4 @@
+import logging
 import os
 import pandas as pd
 import numpy as np
@@ -6,6 +7,10 @@ import scipy.linalg as linalg
 from scipy.interpolate import interp1d, RegularGridInterpolator
 import matplotlib.pyplot as plt
 import matplotlib.ticker as ticker
+
+from .timer import timeit
+
+logger = logging.getLogger(__name__)
 
 @njit(fastmath=True, cache=True)
 def _integrate_CD0_kernel(cd0, chord, y0, span, wing_area):
@@ -718,6 +723,7 @@ class HPADesigner():
         return wing
     
 
+    @timeit(logger=logger)
     def _compute_wing_weight(self):
         # 初始化
         n_seg = len(self.ply_wing)
@@ -805,6 +811,7 @@ class HPADesigner():
 
         
 
+    @timeit(logger=logger)
     def _compute_local_lift(self):
         # 机身+尾翼重量经验估计
         if self.span > 15.0:
@@ -834,6 +841,7 @@ class HPADesigner():
     # 注意: 这里 self.local_lift 和原来一样是 shape (n_struc,)
     #       最后一项为0.0
 
+    @timeit(logger=logger)
     def _compute_power_aero(self):
         # 1. 雷诺数
         self.re_aero = self.chord_aero * self.v_inf * self.rho / self.visc_mu
@@ -895,6 +903,7 @@ class HPADesigner():
         self.power_constraint = self.power - self.max_power
 
 
+    @timeit(logger=logger)
     def _compute_power(self):
         # 1. 雷诺数 (细网格)
         self.re = self.chord * self.v_inf * self.rho / self.visc_mu
@@ -1022,6 +1031,7 @@ class HPADesigner():
         self.GIp[-1] = self.GIp[-2]
 
     
+    @timeit(logger=logger)
     def _compute_moment(self, y, F):
         """
         JIT 加速版本的弯矩计算（无轴向力）。
@@ -1035,6 +1045,7 @@ class HPADesigner():
         return M
 
 
+    @timeit(logger=logger)
     def _compute_moment_with_axial_force(self, y, F, T, EI):
         """
         JIT 加速版本的弯矩/剪力计算（考虑轴向力）。
@@ -1245,6 +1256,7 @@ class HPADesigner():
                 update(STIFFNESS=False)
 
 
+    @timeit(logger=logger)
     def _compute_constraints(self):
         self.max_strain = max(np.abs(self.strain).max(), np.abs(self.strain_zerolift).max())
         self.wing_tip_deflection = self.total_deflection[-1]

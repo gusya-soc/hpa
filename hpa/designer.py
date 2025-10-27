@@ -10,7 +10,7 @@ import matplotlib.ticker as ticker
 @njit(fastmath=True, cache=True)
 def _integrate_CD0_kernel(cd0, chord, y0, span, wing_area):
     """
-    计算机翼寄生阻力系数 CD0 （对应原始公式）
+    Compute the wing parasitic drag coefficient CD0 (matching the original formula).
     CD0 = sum[ 0.5*(cd0[i+1]*chord[i+1] + cd0[i]*chord[i+1])
                * |dy| * span/2 ] * 2 / wing_area
     """
@@ -22,7 +22,7 @@ def _integrate_CD0_kernel(cd0, chord, y0, span, wing_area):
         dy = y0[i+1] - y0[i]
         if dy < 0.0:
             dy = -dy
-        # 注意这里保持和原代码一致的公式：
+        # Keep the same formula as the original implementation:
         # 0.5*(cd0[i+1]*chord[i+1] + cd0[i]*chord[i+1])
         val_section = 0.5*(cd0[i+1]*chord[i+1] + cd0[i]*chord[i+1])
         acc += val_section * dy * span_half
@@ -34,7 +34,7 @@ def _integrate_CD0_kernel(cd0, chord, y0, span, wing_area):
 @njit(fastmath=True, cache=True)
 def _compute_mac_kernel(chord, y0, span, wing_area):
     """
-    根据原公式计算平均气动弦长 (mac):
+    Compute the mean aerodynamic chord (mac) following the original formula:
     mac = 2/S * sum[ |dy|*span/2 * 0.5*(c[i+1]^2 + c[i]^2) ]
     """
     n = y0.shape[0]
@@ -57,28 +57,29 @@ def _compute_mac_kernel(chord, y0, span, wing_area):
 @njit(cache=True,fastmath=True)
 def _compute_moment_jit(y, F):
     """
-    计算在无轴向力情况下的弯矩分布。
-    等价于原先 _compute_moment 的计算，但写成显式循环形式，便于 numba 编译。
-    
-    参数:
-        y : 1D array, 位置坐标 (同原函数传入的 y)
-        F : 1D array, 分布载荷 (同原函数传入的 F)
-    返回:
-        M : 1D array, 各位置的弯矩
+    Compute the bending moment distribution without axial force.
+    This is equivalent to the original _compute_moment calculation but written as
+    explicit loops to facilitate numba compilation.
+
+    Parameters:
+        y : 1D array, position coordinates (same input as the original function)
+        F : 1D array, distributed loads (same input as the original function)
+    Returns:
+        M : 1D array, bending moment at each position
     """
     n = y.shape[0]
 
-    # 反转，以翼尖为起点往内积分（和原版 y[::-1], F[::-1] 一致）
+    # Reverse arrays so integration starts from the tip inward (matches y[::-1], F[::-1] in the original code)
     y_rev = y[::-1].copy()
     F_rev = F[::-1].copy()
 
-    # 剪力的积分: cumulative sum of F_rev
+    # Integrate shear force: cumulative sum of F_rev
     cumsum_F = np.zeros(n)
     cumsum_F[0] = F_rev[0]
     for i in range(1, n):
         cumsum_F[i] = cumsum_F[i-1] + F_rev[i]
 
-    # 弯矩的增量项:
+    # Increment of bending moment:
     # tmp[i] = (cumsum_F[i] + 0.5 * F_rev[i+1]) * |y_rev[i+1] - y_rev[i]|
     tmp = np.zeros(n-1)
     for i in range(n-1):
@@ -88,18 +89,18 @@ def _compute_moment_jit(y, F):
             dy = -dy
         tmp[i] = seg_load * dy
 
-    # 累积分得到弯矩沿 y_rev 的分布
+    # Cumulative sum to obtain the bending moment distribution along y_rev
     cumsum_tmp = np.zeros(n-1)
     cumsum_tmp[0] = tmp[0]
     for i in range(1, n-1):
         cumsum_tmp[i] = cumsum_tmp[i-1] + tmp[i]
 
-    # M_rev[0] = 0 (自由端弯矩为0), M_rev[i+1] = cumsum_tmp[i]
+    # M_rev[0] = 0 (zero moment at the free end), M_rev[i+1] = cumsum_tmp[i]
     M_rev = np.zeros(n)
     for i in range(n-1):
         M_rev[i+1] = cumsum_tmp[i]
 
-    # 翻回原顺序
+    # Flip back to the original ordering
     M = M_rev[::-1].copy()
     return M
     
@@ -107,24 +108,25 @@ def _compute_moment_jit(y, F):
 @njit(cache=True,fastmath=True)
 def _compute_moment_with_axial_force_jit(y, F, T, EI):
     """
-    计算存在轴向力 (T) 情况下的弯矩 M 和剪力 S，使用梁柱理论的离散后向递推。
+    Compute bending moment M and shear force S in the presence of axial force (T)
+    using the discrete backward recursion from beam-column theory.
 
-    参数:
-        y : 1D array, 位置坐标
-        F : 1D array, 分布载荷 (向上正 or 向下正，和原代码一致)
-        T : 1D array, 轴向力分布 (拉力/压力, 和原代码一致)
-        EI: 1D array, 弯曲刚度分布
+    Parameters:
+        y : 1D array, position coordinates
+        F : 1D array, distributed load (upwards or downwards, consistent with the original code)
+        T : 1D array, axial force distribution (tension/compression, same convention as the original code)
+        EI: 1D array, bending stiffness distribution
 
-    返回:
-        M : 1D array, 弯矩分布
-        S : 1D array, 剪力分布
+    Returns:
+        M : 1D array, bending moment distribution
+        S : 1D array, shear force distribution
     """
     n = y.shape[0]
 
     M = np.zeros(n)
     S = np.zeros(n)
 
-    # 段长 L[i] = |y[i+1]-y[i]|, 长度 n-1
+    # Segment length L[i] = |y[i+1]-y[i]|, length n-1
     L = np.zeros(n-1)
     for i in range(n-1):
         dyi = y[i+1] - y[i]
@@ -132,7 +134,7 @@ def _compute_moment_with_axial_force_jit(y, F, T, EI):
             dyi = -dyi
         L[i] = dyi
 
-    # 反向递推，从翼尖往翼根:
+    # Backward recursion from tip to root:
     # TL_EI = T[i]*(0.5*L[i])**2 / EI[i]
     # S[i]   = (F[i] + (1-TL_EI)*S[i+1] - T[i]*L[i]*M[i+1]/EI[i]) / (1+TL_EI)
     # M[i]   = (0.5*L[i]*F[i] + (1-TL_EI)*M[i+1] + L[i]*S[i+1]) / (1+TL_EI)
@@ -158,9 +160,9 @@ def _compute_moment_with_axial_force_jit(y, F, T, EI):
 @njit(fastmath=True, cache=True)
 def _local_lift_kernel(y0, local_cl, chord, rho, v_inf, span):
     """
-    给定展向离散点 (y0), 当量局部 cl 和 chord，
-    计算每个离散区段的升力分布 (N) 并返回长度 len(y0) 的数组，
-    最后一格为0（无后续区段）。
+    Given spanwise grid points (y0) along with equivalent local cl and chord,
+    compute the lift for each discrete section (N) and return an array of length len(y0).
+    The last element is zero because there is no subsequent section.
     """
     n = y0.shape[0]
     out = np.zeros(n)
@@ -168,42 +170,42 @@ def _local_lift_kernel(y0, local_cl, chord, rho, v_inf, span):
     span_half = 0.5 * span
 
     for k in range(n-1):
-        dy = y0[k+1] - y0[k]  # y0 单调递增，dy>=0
+        dy = y0[k+1] - y0[k]  # y0 is monotonically increasing so dy >= 0
         area_equiv = 0.5*(local_cl[k+1]*chord[k+1] + local_cl[k]*chord[k])
-        # 动压 q = 0.5 rho v^2
+        # Dynamic pressure q = 0.5 rho v^2
         out[k] = 0.5*rho*v2 * (dy*span_half) * area_equiv
 
-    # out[n-1] 默认=0
+    # out[n-1] remains 0 by default
     return out
 
 
 
 @njit(fastmath=True, cache=True)
 def _wing_weight_ply_kernel(
-    y0,                # 1D array: 展向无量纲位置 self.y0
-    diameter,          # 1D array: 局部直径 self.diameter
+    y0,                # 1D array: non-dimensional spanwise positions self.y0
+    diameter,          # 1D array: local diameter self.diameter
     diff_y0_last0,     # 1D array: np.diff(y0) with last element 0
-    y0_start, y0_end,  # floats: 这一大段翼段 i 的起止位置 (self.y_div[i], self.y_div[i+1])
-    start_frac, end_frac,  # floats: ply[2], ply[3] 相对段内的起止 (0~1)
-    phi_rad,           # float: 周向覆盖角（弧度）= np.deg2rad(ply[1])
-    t_ply,             # float: ply厚度 ply[4]
+    y0_start, y0_end,  # floats: start/end of the major wing segment i (self.y_div[i], self.y_div[i+1])
+    start_frac, end_frac,  # floats: ply[2], ply[3] defining start/end fractions within the segment (0~1)
+    phi_rad,           # float: circumferential coverage angle (radians) = np.deg2rad(ply[1])
+    t_ply,             # float: ply thickness ply[4]
     span,              # float: self.span
     density_CFRP,      # float: self.density_CFRP
     coef_rear_spar     # float: self.coef_rear_spar
 ):
     """
-    对单个铺层 ply 计算:
-    - 该 ply 给整段梁带来的总重量贡献 (beam_weight_inc)
-    - 该 ply 沿展向对 wing_weight 的分布式线密度贡献 (wing_w_inc array)
+    Compute contributions from a single ply:
+    - Total weight increment this ply adds to the entire spar segment (beam_weight_inc)
+    - Distributed line density contribution along the span (wing_w_inc array)
 
-    返回:
+    Returns:
     beam_weight_inc : float
     wing_w_inc      : 1D array (same length as y0)
     """
     n = y0.shape[0]
     wing_w_inc = np.zeros(n)
 
-    # 该 ply 在翼段内的实际 y0 覆盖范围
+    # Actual y0 coverage of this ply within the wing segment
     seg_len = y0_end - y0_start
     start_y = start_frac * seg_len + y0_start
     end_y   = end_frac   * seg_len + y0_start
@@ -211,19 +213,19 @@ def _wing_weight_ply_kernel(
     span_half = 0.5 * span
     max_R = 0.0
 
-    # 遍历整个翼展离散点
+    # Traverse all discrete spanwise points
     for k in range(n):
         yk = y0[k]
         if (yk >= start_y) and (yk <= end_y):
-            R = 0.5 * diameter[k]    # 半径
+            R = 0.5 * diameter[k]    # radius
             if R > max_R:
                 max_R = R
 
-            # diff_y0_last0[k] 是相邻网格段长度(无量纲), 最后1个点是0
-            # L_segment * span_half = 实际物理长度增量
+            # diff_y0_last0[k] is the length of the neighboring segment (non-dimensional), last entry is 0
+            # L_segment * span_half = physical length increment
             Lseg = diff_y0_last0[k]
 
-            # 该 ply 在点 k 对线密度的贡献
+            # Contribution of this ply to the line density at point k
             # density_CFRP*2*phi*R*thickness * (span/2)*Lseg * coef_rear_spar
             wing_w_inc[k] = (
                 density_CFRP * 2.0 * phi_rad * R * t_ply
@@ -231,7 +233,7 @@ def _wing_weight_ply_kernel(
             )
         # else: stays 0
 
-    # 整条 ply 折算到梁重量 (beam)
+    # Convert the entire ply to spar weight (beam)
     # density_CFRP * 2*phi * max_R * t_ply * (span/2)
     # * ((ply_end - ply_start)*(y0_end - y0_start))
     beam_weight_inc = (
@@ -719,25 +721,25 @@ class HPADesigner():
     
 
     def _compute_wing_weight(self):
-        # 初始化
+        # Initialize containers
         n_seg = len(self.ply_wing)
         self.beam_weight = np.zeros(n_seg)
         self.wing_weight = np.zeros(self.n_struc)
 
-        # 预先准备展向步长 diff_y0_last0, 避免在循环里每次 np.hstack
+        # Pre-compute spanwise step diff_y0_last0 to avoid np.hstack in the loop
         diff_y0_last0 = np.zeros_like(self.y0)
         if len(self.y0) > 1:
             diff_y0_last0[:-1] = np.diff(self.y0)
             diff_y0_last0[-1] = 0.0
 
-        # --- 主梁 / 碳纤层贡献 ---
+        # --- Main spar / CFRP ply contribution ---
         for i, plys in enumerate(self.ply_wing):
             y0_start = self.y_div[i]
             y0_end   = self.y_div[i+1]
 
-            # 遍历该段的每一条铺层
+            # Iterate through every ply within this segment
             for ply in plys:
-                # ply 是例如 [angle_deg, phi_deg, start_frac, end_frac, t_ply]
+                # ply entries look like [angle_deg, phi_deg, start_frac, end_frac, t_ply]
                 phi_rad     = np.deg2rad(ply[1])
                 start_frac  = ply[2]
                 end_frac    = ply[3]
@@ -758,20 +760,20 @@ class HPADesigner():
                     self.coef_rear_spar
                 )
 
-                # 累积进全局
+                # Accumulate into the global totals
                 self.beam_weight[i] += beam_inc
                 self.wing_weight    += wing_inc
 
-        # --- 节点/接头重量 (经验公式) ---
+        # --- Node/joint weight (empirical formula) ---
         for y_joint in self.y_div[1:-1]:
-            # 找到 y0 < y_joint 的最后一个 index
-            # 原代码: i = np.argmax(np.where(self.y0<y_joint, self.y0, 0))
-            # 这个等价于: 找到 self.y0 <= y_joint 中最大的 index
+            # Find the last index where y0 < y_joint
+            # Original code: i = np.argmax(np.where(self.y0<y_joint, self.y0, 0))
+            # Equivalent to finding the largest index with self.y0 <= y_joint
             idx = np.argmax(np.where(self.y0 < y_joint, self.y0, 0.0))
             self.wing_weight[idx] += 0.5*self.diameter[idx+1]*2.293 + 3.373e-2
 
-        # --- 肋 + 翼面蒙皮重量 ---
-        # 原式:
+        # --- Rib + wing skin weight ---
+        # Original expression:
         # self.wing_weight += np.hstack([
         #   self.density_rib_skin * np.diff(self.y0)*0.5*self.span * 0.5*(self.chord[1:] + self.chord[:-1]),
         #   0
@@ -787,7 +789,7 @@ class HPADesigner():
             )
         self.wing_weight += rib_skin_inc
 
-        # --- 拉索重量 (简化) ---
+        # --- Wire weight (simplified) ---
         i_wire = np.argmin(np.abs(self.y0 - self.y_wire))
         wire_ratio = self.wire_tension / self.wire_max_tension
         wire_area = self.base_wire_area * wire_ratio
@@ -806,23 +808,23 @@ class HPADesigner():
         
 
     def _compute_local_lift(self):
-        # 机身+尾翼重量经验估计
+        # Empirical estimate for fuselage + tail weight
         if self.span > 15.0:
             self.body_tail_weight = 0.007*(self.span - 15.0)**2.0 + 14.0
         else:
             self.body_tail_weight = 14.0
 
-        # 总重
+        # Total weight
         self.empty_weight = self.wing_weight.sum()*2.0 + self.body_tail_weight
         self.weight = self.pilot_weight + self.water_weight + self.empty_weight + self.payload
 
-        # 平衡升力 => 巡航速度
+        # Lift equilibrium => cruise speed
         self.v_inf = np.sqrt(
             2.0*self.weight*self.gravity
             /(self.rho*self.wing_area*self.CL)
         )
 
-        # 局部升力分布（半翼）
+        # Local lift distribution (half wing)
         self.local_lift = _local_lift_kernel(
             self.y0,
             self.local_cl,
@@ -831,22 +833,21 @@ class HPADesigner():
             self.v_inf,
             self.span
         )
-    # 注意: 这里 self.local_lift 和原来一样是 shape (n_struc,)
-    #       最后一项为0.0
+    # Note: self.local_lift has shape (n_struc,) as before and the last entry is 0.0
 
     def _compute_power_aero(self):
-        # 1. 雷诺数
+        # 1. Reynolds number
         self.re_aero = self.chord_aero * self.v_inf * self.rho / self.visc_mu
 
-        # 2. 剖面阻力系数 (需要 Python 侧插值器)
-        #    输入是 [airfoil, Re_clipped, aoa_clipped] per station
+        # 2. Profile drag coefficient (requires Python-side interpolator)
+        #    Inputs are [airfoil, Re_clipped, aoa_clipped] per station
         re_clip  = np.clip(self.re_aero, self.re_min, self.re_max)
         aoa_clip = np.clip(self.aoa_aero, self.aoa_min, self.aoa_max)
         # shape (N,3)
         interp_input = np.vstack([self.airfoil_aero, re_clip, aoa_clip]).T
         self.cd0_aero = self.cd0_interp(interp_input)
 
-        # 3. 机翼寄生阻力系数 CD0 (numba kernel)
+        # 3. Wing parasitic drag coefficient CD0 (numba kernel)
         self.CD0 = _integrate_CD0_kernel(
             self.cd0_aero,
             self.chord_aero,
@@ -855,7 +856,7 @@ class HPADesigner():
             self.wing_area
         )
 
-        # 4. 平均气动弦长 mac (numba kernel)
+        # 4. Mean aerodynamic chord mac (numba kernel)
         self.mac = _compute_mac_kernel(
             self.chord_aero,
             self.y0_aero,
@@ -863,7 +864,7 @@ class HPADesigner():
             self.wing_area
         )
 
-        # 5. 尾翼面积 (标量公式)
+        # 5. Tail areas (scalar formula)
         self.holizontal_tail_area = (
             self.wing_area * self.mac * self.horisontal_tail_volume / self.horisontal_tail_arm
         )
@@ -871,7 +872,7 @@ class HPADesigner():
             self.wing_area * self.span * self.vertical_tail_volume / self.vertical_tail_arm
         )
 
-        # 6. 整机阻力
+        # 6. Total aircraft drag
         dyn_pressure = 0.5 * self.rho * (self.v_inf**2)
         parasite_term = (
             self.cdS_body
@@ -881,25 +882,25 @@ class HPADesigner():
         )
         self.drag = (self.calibration_factor*parasite_term + self.CDi*self.wing_area) * dyn_pressure
 
-        # 整机 CD
+        # Total aircraft CD
         self.CD = self.drag / (dyn_pressure * self.wing_area)
 
-        # 7. 功率需求
+        # 7. Power requirement
         self.power = self.drag * self.v_inf / self.drivetrain_efficiency
 
-        # 记录气动特性到表
+        # Record aerodynamic characteristics in the table
         self.aero['re'] = self.re_aero
         self.aero['cd0'] = self.cd0_aero
 
-        # 8. 功率约束
+        # 8. Power constraint
         self.power_constraint = self.power - self.max_power
 
 
     def _compute_power(self):
-        # 1. 雷诺数 (细网格)
+        # 1. Reynolds number (refined grid)
         self.re = self.chord * self.v_inf * self.rho / self.visc_mu
 
-        # 2. 剖面阻力系数 (Python 插值)
+        # 2. Profile drag coefficient (Python interpolation)
         re_clip  = np.clip(self.re, self.re_min, self.re_max)
         aoa_clip = np.clip(self.aoa, self.aoa_min, self.aoa_max)
         interp_input = np.vstack([self.airfoil, re_clip, aoa_clip]).T
@@ -922,7 +923,7 @@ class HPADesigner():
             self.wing_area
         )
 
-        # 5. 尾翼面积
+        # 5. Tail areas
         self.holizontal_tail_area = (
             self.wing_area * self.mac * self.horisontal_tail_volume / self.horisontal_tail_arm
         )
@@ -930,7 +931,7 @@ class HPADesigner():
             self.wing_area * self.span * self.vertical_tail_volume / self.vertical_tail_arm
         )
 
-        # 6. 整机阻力
+        # 6. Total aircraft drag
         dyn_pressure = 0.5 * self.rho * (self.v_inf**2)
         parasite_term = (
             self.cdS_body
@@ -940,13 +941,13 @@ class HPADesigner():
         )
         self.drag = (self.calibration_factor*parasite_term + self.CDi*self.wing_area) * dyn_pressure
 
-        # 整机 CD
+        # Total aircraft CD
         self.CD = self.drag / (dyn_pressure * self.wing_area)
 
-        # 7. 功率需求
+        # 7. Power requirement
         self.power = self.drag * self.v_inf / self.drivetrain_efficiency
 
-        # 8. 功率约束
+        # 8. Power constraint
         self.power_constraint = self.power - self.max_power
 
 
@@ -1024,10 +1025,10 @@ class HPADesigner():
     
     def _compute_moment(self, y, F):
         """
-        JIT 加速版本的弯矩计算（无轴向力）。
-        现在直接调用 numba 编译过的 _compute_moment_jit 内核。
+        JIT-accelerated bending moment calculation without axial force.
+        Directly calls the numba-compiled _compute_moment_jit kernel.
         """
-        # 确保传给 numba 的是连续的 NumPy 数组（避免奇怪的 view 或 pandas index）
+        # Ensure contiguous NumPy arrays are passed to numba (avoid strange views or pandas indices)
         y_arr = np.asarray(y, dtype=np.float64)
         F_arr = np.asarray(F, dtype=np.float64)
 
@@ -1037,8 +1038,8 @@ class HPADesigner():
 
     def _compute_moment_with_axial_force(self, y, F, T, EI):
         """
-        JIT 加速版本的弯矩/剪力计算（考虑轴向力）。
-        调用 numba 编译过的 _compute_moment_with_axial_force_jit。
+        JIT-accelerated bending moment/shear calculation with axial force.
+        Calls the numba-compiled _compute_moment_with_axial_force_jit.
         """
         y_arr  = np.asarray(y,  dtype=np.float64)
         F_arr  = np.asarray(F,  dtype=np.float64)

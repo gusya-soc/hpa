@@ -8,7 +8,7 @@ from scipy.interpolate import interp1d, RegularGridInterpolator
 import matplotlib.pyplot as plt
 import matplotlib.ticker as ticker
 
-from .timer import timeit
+from mytimer import timeit
 
 logger = logging.getLogger(__name__)
 
@@ -723,7 +723,7 @@ class HPADesigner():
         return wing
     
 
-    @timeit(logger=logger)
+    @timeit
     def _compute_wing_weight(self):
         # 初始化
         n_seg = len(self.ply_wing)
@@ -811,7 +811,7 @@ class HPADesigner():
 
         
 
-    @timeit(logger=logger)
+    @timeit
     def _compute_local_lift(self):
         # 机身+尾翼重量经验估计
         if self.span > 15.0:
@@ -841,7 +841,7 @@ class HPADesigner():
     # 注意: 这里 self.local_lift 和原来一样是 shape (n_struc,)
     #       最后一项为0.0
 
-    @timeit(logger=logger)
+    @timeit
     def _compute_power_aero(self):
         # 1. 雷诺数
         self.re_aero = self.chord_aero * self.v_inf * self.rho / self.visc_mu
@@ -903,7 +903,7 @@ class HPADesigner():
         self.power_constraint = self.power - self.max_power
 
 
-    @timeit(logger=logger)
+    @timeit
     def _compute_power(self):
         # 1. 雷诺数 (细网格)
         self.re = self.chord * self.v_inf * self.rho / self.visc_mu
@@ -959,7 +959,7 @@ class HPADesigner():
         self.power_constraint = self.power - self.max_power
 
 
-
+    @timeit
     def _stiffness(self):
         self.Ex_ply = np.zeros([self.n_div, self.max_plys])
         self.EI_ply = np.zeros([self.n_struc, self.max_plys])
@@ -1031,7 +1031,7 @@ class HPADesigner():
         self.GIp[-1] = self.GIp[-2]
 
     
-    @timeit(logger=logger)
+    @timeit
     def _compute_moment(self, y, F):
         """
         JIT 加速版本的弯矩计算（无轴向力）。
@@ -1045,7 +1045,7 @@ class HPADesigner():
         return M
 
 
-    @timeit(logger=logger)
+    @timeit
     def _compute_moment_with_axial_force(self, y, F, T, EI):
         """
         JIT 加速版本的弯矩/剪力计算（考虑轴向力）。
@@ -1113,7 +1113,7 @@ class HPADesigner():
         self.torque = self.torque[::-1].cumsum()[::-1]
         self.twist = np.rad2deg(np.hstack([0.0, self.torque/(0.5*(self.GIp[1:] + self.GIp[:-1]))*np.diff(self.y)]).cumsum())
 
-
+    @timeit
     def _optimize_ply(self):
         def update_ply(j, y0_j, strain_const, y0_start, y0_end, root_limit, tip_limit):
             strain = np.abs(self.moment/(self.EI - self.EI_ply[:,j-4])*0.5*self.diameter) + self.axial_force/(self.EA - self.EA_ply[:,j-4])
@@ -1256,7 +1256,7 @@ class HPADesigner():
                 update(STIFFNESS=False)
 
 
-    @timeit(logger=logger)
+    @timeit
     def _compute_constraints(self):
         self.max_strain = max(np.abs(self.strain).max(), np.abs(self.strain_zerolift).max())
         self.wing_tip_deflection = self.total_deflection[-1]
@@ -1452,7 +1452,7 @@ class HPADesigner():
 
 if __name__ == "__main__":
     # use FINE_MODE=True if you are designing a practical HPA. The default mode (False) is intended for benchmarking the optimization algorithm
-    hpa = HPADesigner(n_div=4, max_plys=8, level=0, AIRFOIL=True, WIRE=True, DIHEDRAL=False, PAYLOAD=False, FINE_MODE=False)
+    hpa = HPADesigner(n_div=4, max_plys=8, level=1, AIRFOIL=True, WIRE=True, DIHEDRAL=False, PAYLOAD=False, FINE_MODE=True)
 
     # use baseline
     x = hpa.baseline()

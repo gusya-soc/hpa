@@ -6,6 +6,8 @@ from scipy.interpolate import interp1d, RegularGridInterpolator
 import matplotlib.pyplot as plt
 import matplotlib.ticker as ticker
 
+from hpa.mytimer import timeit
+
 
 class HPADesigner():
     def __init__(self, n_div=4, max_plys = 10, level=0, AIRFOIL=False, WIRE=True, DIHEDRAL=False, PAYLOAD=False, FINE_MODE=False):
@@ -482,7 +484,7 @@ class HPADesigner():
         self.dihedral_position = 0.5*self.span*self.y0*np.sin(np.deg2rad(self.dihedral_angle_at_root))
         return wing
     
-
+    @timeit
     def _compute_wing_weight(self):
        # beam
         self.beam_weight = np.zeros(len(self.ply_wing))
@@ -512,7 +514,7 @@ class HPADesigner():
         wire_weight = self.wire_length*wire_area*self.wire_density + self.wire_joint_weight*(wire_ratio**1.5)
         self.wing_weight[i_wire] += wire_weight
     
-
+    @timeit
     def _compute_local_lift(self):
         # weight & velocity
         self.body_tail_weight = 0.007*(self.span - 15.0)**2.0 + 14.0 if self.span > 15.0 else 14.0 #empirical estimation
@@ -521,7 +523,7 @@ class HPADesigner():
         self.v_inf = np.sqrt(2*self.weight*self.gravity/(self.rho*self.wing_area*self.CL))
         self.local_lift = np.hstack([0.5*self.rho*(self.v_inf**2)*(np.diff(self.y0)*self.span*0.5)*0.5*(self.local_cl[1:]*self.chord[1:] + self.local_cl[:-1]*self.chord[:-1]), 0.0]) #[N]
 
-
+    @timeit
     def _compute_power_aero(self):
         # computation with aerodynamic (coarse) mesh points
         # drag & power
@@ -542,7 +544,7 @@ class HPADesigner():
         self.aero['cd0'] = self.cd0_aero
         self.power_constraint = self.power - self.max_power
 
-
+    @timeit
     def _compute_power(self):
         # computation with structural (fine) mesh points 
         # drag & power
@@ -561,7 +563,7 @@ class HPADesigner():
         self.power = self.drag*self.v_inf/self.drivetrain_efficiency
         self.power_constraint = self.power - self.max_power
 
-
+    @timeit
     def _stiffness(self):
         self.Ex_ply = np.zeros([self.n_div, self.max_plys])
         self.EI_ply = np.zeros([self.n_struc, self.max_plys])
@@ -632,12 +634,12 @@ class HPADesigner():
         self.EA[-1] = self.EA[-2]
         self.GIp[-1] = self.GIp[-2]
 
-
+    @timeit
     def _compute_moment(self, y, F):
         y, F = y[::-1], F[::-1]
         return np.hstack([0.0, np.cumsum((np.cumsum(F)[:-1] + 0.5*F[1:])*np.abs(np.diff(y)))])[::-1]
 
-
+    @timeit
     def _compute_moment_with_axial_force(self, y, F, T, EI):
         # beam-column theory
         n = len(y)
@@ -649,7 +651,7 @@ class HPADesigner():
             M[i] = (0.5*L[i]*F[i] + (1 - TL_EI)*M[i+1] + L[i]*S[i+1])/(1 + TL_EI)
         return M, S
 
-
+    
     def _evaluate_zerolift_deflection(self):
         self.moment_zerolift = self._compute_moment(y=self.y0*self.span*0.5, F=-self.wing_weight*self.gravity)
         self.M_EI_zerolift = self.moment_zerolift/self.EI
@@ -703,7 +705,7 @@ class HPADesigner():
         self.torque = self.torque[::-1].cumsum()[::-1]
         self.twist = np.rad2deg(np.hstack([0.0, self.torque/(0.5*(self.GIp[1:] + self.GIp[:-1]))*np.diff(self.y)]).cumsum())
 
-
+    @timeit
     def _optimize_ply(self):
         def update_ply(j, y0_j, strain_const, y0_start, y0_end, root_limit, tip_limit):
             strain = np.abs(self.moment/(self.EI - self.EI_ply[:,j-4])*0.5*self.diameter) + self.axial_force/(self.EA - self.EA_ply[:,j-4])
@@ -845,7 +847,7 @@ class HPADesigner():
             if not self.FINE_MODE:
                 update(STIFFNESS=False)
 
-
+    @timeit
     def _compute_constraints(self):
         self.max_strain = max(np.abs(self.strain).max(), np.abs(self.strain_zerolift).max())
         self.wing_tip_deflection = self.total_deflection[-1]

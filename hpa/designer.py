@@ -1,10 +1,245 @@
 import os
 import pandas as pd
 import numpy as np
+from numba import njit
 import scipy.linalg as linalg
 from scipy.interpolate import interp1d, RegularGridInterpolator
 import matplotlib.pyplot as plt
 import matplotlib.ticker as ticker
+
+@njit(fastmath=True, cache=True)
+def _integrate_CD0_kernel(cd0, chord, y0, span, wing_area):
+    """
+    计算机翼寄生阻力系数 CD0 （对应原始公式）
+    CD0 = sum[ 0.5*(cd0[i+1]*chord[i+1] + cd0[i]*chord[i+1])
+               * |dy| * span/2 ] * 2 / wing_area
+    """
+    n = y0.shape[0]
+    acc = 0.0
+    span_half = 0.5 * span
+
+    for i in range(n-1):
+        dy = y0[i+1] - y0[i]
+        if dy < 0.0:
+            dy = -dy
+        # 注意这里保持和原代码一致的公式：
+        # 0.5*(cd0[i+1]*chord[i+1] + cd0[i]*chord[i+1])
+        val_section = 0.5*(cd0[i+1]*chord[i+1] + cd0[i]*chord[i+1])
+        acc += val_section * dy * span_half
+
+    CD0 = acc * 2.0 / wing_area
+    return CD0
+
+
+@njit(fastmath=True, cache=True)
+def _compute_mac_kernel(chord, y0, span, wing_area):
+    """
+    根据原公式计算平均气动弦长 (mac):
+    mac = 2/S * sum[ |dy|*span/2 * 0.5*(c[i+1]^2 + c[i]^2) ]
+    """
+    n = y0.shape[0]
+    acc = 0.0
+    span_half = 0.5 * span
+
+    for i in range(n-1):
+        dy = y0[i+1] - y0[i]
+        if dy < 0.0:
+            dy = -dy
+        c1 = chord[i+1]
+        c0 = chord[i]
+        acc += dy*span_half * 0.5*(c1*c1 + c0*c0)
+
+    mac = 2.0/wing_area * acc
+    return mac
+
+
+
+@njit(cache=True,fastmath=True)
+def _compute_moment_jit(y, F):
+    """
+    计算在无轴向力情况下的弯矩分布。
+    等价于原先 _compute_moment 的计算，但写成显式循环形式，便于 numba 编译。
+    
+    参数:
+        y : 1D array, 位置坐标 (同原函数传入的 y)
+        F : 1D array, 分布载荷 (同原函数传入的 F)
+    返回:
+        M : 1D array, 各位置的弯矩
+    """
+    n = y.shape[0]
+
+    # 反转，以翼尖为起点往内积分（和原版 y[::-1], F[::-1] 一致）
+    y_rev = y[::-1].copy()
+    F_rev = F[::-1].copy()
+
+    # 剪力的积分: cumulative sum of F_rev
+    cumsum_F = np.zeros(n)
+    cumsum_F[0] = F_rev[0]
+    for i in range(1, n):
+        cumsum_F[i] = cumsum_F[i-1] + F_rev[i]
+
+    # 弯矩的增量项:
+    # tmp[i] = (cumsum_F[i] + 0.5 * F_rev[i+1]) * |y_rev[i+1] - y_rev[i]|
+    tmp = np.zeros(n-1)
+    for i in range(n-1):
+        seg_load = cumsum_F[i] + 0.5 * F_rev[i+1]
+        dy = y_rev[i+1] - y_rev[i]
+        if dy < 0.0:
+            dy = -dy
+        tmp[i] = seg_load * dy
+
+    # 累积分得到弯矩沿 y_rev 的分布
+    cumsum_tmp = np.zeros(n-1)
+    cumsum_tmp[0] = tmp[0]
+    for i in range(1, n-1):
+        cumsum_tmp[i] = cumsum_tmp[i-1] + tmp[i]
+
+    # M_rev[0] = 0 (自由端弯矩为0), M_rev[i+1] = cumsum_tmp[i]
+    M_rev = np.zeros(n)
+    for i in range(n-1):
+        M_rev[i+1] = cumsum_tmp[i]
+
+    # 翻回原顺序
+    M = M_rev[::-1].copy()
+    return M
+    
+    
+@njit(cache=True,fastmath=True)
+def _compute_moment_with_axial_force_jit(y, F, T, EI):
+    """
+    计算存在轴向力 (T) 情况下的弯矩 M 和剪力 S，使用梁柱理论的离散后向递推。
+
+    参数:
+        y : 1D array, 位置坐标
+        F : 1D array, 分布载荷 (向上正 or 向下正，和原代码一致)
+        T : 1D array, 轴向力分布 (拉力/压力, 和原代码一致)
+        EI: 1D array, 弯曲刚度分布
+
+    返回:
+        M : 1D array, 弯矩分布
+        S : 1D array, 剪力分布
+    """
+    n = y.shape[0]
+
+    M = np.zeros(n)
+    S = np.zeros(n)
+
+    # 段长 L[i] = |y[i+1]-y[i]|, 长度 n-1
+    L = np.zeros(n-1)
+    for i in range(n-1):
+        dyi = y[i+1] - y[i]
+        if dyi < 0.0:
+            dyi = -dyi
+        L[i] = dyi
+
+    # 反向递推，从翼尖往翼根:
+    # TL_EI = T[i]*(0.5*L[i])**2 / EI[i]
+    # S[i]   = (F[i] + (1-TL_EI)*S[i+1] - T[i]*L[i]*M[i+1]/EI[i]) / (1+TL_EI)
+    # M[i]   = (0.5*L[i]*F[i] + (1-TL_EI)*M[i+1] + L[i]*S[i+1]) / (1+TL_EI)
+    for i in range(n-2, -1, -1):
+        halfL = 0.5 * L[i]
+        TL_EI = T[i] * (halfL * halfL) / EI[i]
+        denom = 1.0 + TL_EI
+
+        S[i] = (
+            F[i]
+            + (1.0 - TL_EI) * S[i+1]
+            - T[i] * L[i] * M[i+1] / EI[i]
+        ) / denom
+
+        M[i] = (
+            halfL * F[i]
+            + (1.0 - TL_EI) * M[i+1]
+            + L[i] * S[i+1]
+        ) / denom
+
+    return M, S
+    
+@njit(fastmath=True, cache=True)
+def _local_lift_kernel(y0, local_cl, chord, rho, v_inf, span):
+    """
+    给定展向离散点 (y0), 当量局部 cl 和 chord，
+    计算每个离散区段的升力分布 (N) 并返回长度 len(y0) 的数组，
+    最后一格为0（无后续区段）。
+    """
+    n = y0.shape[0]
+    out = np.zeros(n)
+    v2 = v_inf * v_inf
+    span_half = 0.5 * span
+
+    for k in range(n-1):
+        dy = y0[k+1] - y0[k]  # y0 单调递增，dy>=0
+        area_equiv = 0.5*(local_cl[k+1]*chord[k+1] + local_cl[k]*chord[k])
+        # 动压 q = 0.5 rho v^2
+        out[k] = 0.5*rho*v2 * (dy*span_half) * area_equiv
+
+    # out[n-1] 默认=0
+    return out
+
+
+
+@njit(fastmath=True, cache=True)
+def _wing_weight_ply_kernel(
+    y0,                # 1D array: 展向无量纲位置 self.y0
+    diameter,          # 1D array: 局部直径 self.diameter
+    diff_y0_last0,     # 1D array: np.diff(y0) with last element 0
+    y0_start, y0_end,  # floats: 这一大段翼段 i 的起止位置 (self.y_div[i], self.y_div[i+1])
+    start_frac, end_frac,  # floats: ply[2], ply[3] 相对段内的起止 (0~1)
+    phi_rad,           # float: 周向覆盖角（弧度）= np.deg2rad(ply[1])
+    t_ply,             # float: ply厚度 ply[4]
+    span,              # float: self.span
+    density_CFRP,      # float: self.density_CFRP
+    coef_rear_spar     # float: self.coef_rear_spar
+):
+    """
+    对单个铺层 ply 计算:
+    - 该 ply 给整段梁带来的总重量贡献 (beam_weight_inc)
+    - 该 ply 沿展向对 wing_weight 的分布式线密度贡献 (wing_w_inc array)
+
+    返回:
+    beam_weight_inc : float
+    wing_w_inc      : 1D array (same length as y0)
+    """
+    n = y0.shape[0]
+    wing_w_inc = np.zeros(n)
+
+    # 该 ply 在翼段内的实际 y0 覆盖范围
+    seg_len = y0_end - y0_start
+    start_y = start_frac * seg_len + y0_start
+    end_y   = end_frac   * seg_len + y0_start
+
+    span_half = 0.5 * span
+    max_R = 0.0
+
+    # 遍历整个翼展离散点
+    for k in range(n):
+        yk = y0[k]
+        if (yk >= start_y) and (yk <= end_y):
+            R = 0.5 * diameter[k]    # 半径
+            if R > max_R:
+                max_R = R
+
+            # diff_y0_last0[k] 是相邻网格段长度(无量纲), 最后1个点是0
+            # L_segment * span_half = 实际物理长度增量
+            Lseg = diff_y0_last0[k]
+
+            # 该 ply 在点 k 对线密度的贡献
+            # density_CFRP*2*phi*R*thickness * (span/2)*Lseg * coef_rear_spar
+            wing_w_inc[k] = (
+                density_CFRP * 2.0 * phi_rad * R * t_ply
+                * span_half * Lseg * coef_rear_spar
+            )
+        # else: stays 0
+
+    # 整条 ply 折算到梁重量 (beam)
+    # density_CFRP * 2*phi * max_R * t_ply * (span/2)
+    # * ((ply_end - ply_start)*(y0_end - y0_start))
+    beam_weight_inc = (
+        density_CFRP * 2.0 * phi_rad * max_R * t_ply
+        * span_half * (end_frac - start_frac) * (seg_len)
+    )
+
+    return beam_weight_inc, wing_w_inc
 
 
 class HPADesigner():
@@ -484,82 +719,236 @@ class HPADesigner():
     
 
     def _compute_wing_weight(self):
-       # beam
-        self.beam_weight = np.zeros(len(self.ply_wing))
+        # 初始化
+        n_seg = len(self.ply_wing)
+        self.beam_weight = np.zeros(n_seg)
         self.wing_weight = np.zeros(self.n_struc)
+
+        # 预先准备展向步长 diff_y0_last0, 避免在循环里每次 np.hstack
+        diff_y0_last0 = np.zeros_like(self.y0)
+        if len(self.y0) > 1:
+            diff_y0_last0[:-1] = np.diff(self.y0)
+            diff_y0_last0[-1] = 0.0
+
+        # --- 主梁 / 碳纤层贡献 ---
         for i, plys in enumerate(self.ply_wing):
             y0_start = self.y_div[i]
-            y0_end = self.y_div[i+1]
+            y0_end   = self.y_div[i+1]
+
+            # 遍历该段的每一条铺层
             for ply in plys:
-                phi = np.deg2rad(ply[1])
-                R = np.where((self.y0>=ply[2]*(y0_end - y0_start)+y0_start)&(self.y0<=ply[3]*(y0_end - y0_start)+y0_start), 0.5*self.diameter, 0)
-                L = np.where((self.y0>=ply[2]*(y0_end - y0_start)+y0_start)&(self.y0<=ply[3]*(y0_end - y0_start)+y0_start), np.hstack([np.diff(self.y0), 0]), 0)
-                ply_weight = self.density_CFRP*2*phi*R.max()*ply[4]*0.5*self.span*(ply[3] - ply[2])*(y0_end - y0_start)
-                self.beam_weight[i] += ply_weight
-                self.wing_weight += self.density_CFRP*2*phi*R*ply[4]*0.5*self.span*L*self.coef_rear_spar
-        # joint
+                # ply 是例如 [angle_deg, phi_deg, start_frac, end_frac, t_ply]
+                phi_rad     = np.deg2rad(ply[1])
+                start_frac  = ply[2]
+                end_frac    = ply[3]
+                t_ply       = ply[4]
+
+                beam_inc, wing_inc = _wing_weight_ply_kernel(
+                    self.y0,
+                    self.diameter,
+                    diff_y0_last0,
+                    y0_start,
+                    y0_end,
+                    start_frac,
+                    end_frac,
+                    phi_rad,
+                    t_ply,
+                    self.span,
+                    self.density_CFRP,
+                    self.coef_rear_spar
+                )
+
+                # 累积进全局
+                self.beam_weight[i] += beam_inc
+                self.wing_weight    += wing_inc
+
+        # --- 节点/接头重量 (经验公式) ---
         for y_joint in self.y_div[1:-1]:
-            i = np.argmax(np.where(self.y0<y_joint, self.y0, 0))
-            self.wing_weight[i] += 0.5*self.diameter[i+1]*2.293+3.373e-2 #empirical estimation
-        # rib and surface
-        self.wing_weight += np.hstack([self.density_rib_skin * np.diff(self.y0)*0.5*self.span * 0.5*(self.chord[1:] + self.chord[:-1]), 0])
-        # wire: simplified estimation for deciding v_inf and drag; actual wire weight and length must be computed for deflected wing
+            # 找到 y0 < y_joint 的最后一个 index
+            # 原代码: i = np.argmax(np.where(self.y0<y_joint, self.y0, 0))
+            # 这个等价于: 找到 self.y0 <= y_joint 中最大的 index
+            idx = np.argmax(np.where(self.y0 < y_joint, self.y0, 0.0))
+            self.wing_weight[idx] += 0.5*self.diameter[idx+1]*2.293 + 3.373e-2
+
+        # --- 肋 + 翼面蒙皮重量 ---
+        # 原式:
+        # self.wing_weight += np.hstack([
+        #   self.density_rib_skin * np.diff(self.y0)*0.5*self.span * 0.5*(self.chord[1:] + self.chord[:-1]),
+        #   0
+        # ])
+        rib_skin_inc = np.zeros_like(self.wing_weight)
+        if len(self.y0) > 1:
+            seg_len = np.diff(self.y0)               # dimensionless dy0
+            seg_area_chord = 0.5*(self.chord[1:] + self.chord[:-1])
+            rib_skin_inc[:-1] = (
+                self.density_rib_skin
+                * seg_len * 0.5*self.span
+                * seg_area_chord
+            )
+        self.wing_weight += rib_skin_inc
+
+        # --- 拉索重量 (简化) ---
         i_wire = np.argmin(np.abs(self.y0 - self.y_wire))
-        wire_ratio = self.wire_tension/self.wire_max_tension
-        wire_area = self.base_wire_area*wire_ratio
-        self.wire_diameter = 2*np.sqrt(wire_area/np.pi)
-        self.wire_length = np.sqrt((self.y_wire*self.span*0.5)**2 + self.z_wire**2)
-        wire_weight = self.wire_length*wire_area*self.wire_density + self.wire_joint_weight*(wire_ratio**1.5)
+        wire_ratio = self.wire_tension / self.wire_max_tension
+        wire_area = self.base_wire_area * wire_ratio
+        self.wire_diameter = 2.0 * np.sqrt(wire_area/np.pi)
+        self.wire_length   = np.sqrt((self.y_wire*self.span*0.5)**2 + self.z_wire**2)
+
+        wire_weight = (
+            self.wire_length * wire_area * self.wire_density
+            + self.wire_joint_weight * (wire_ratio**1.5)
+        )
         self.wing_weight[i_wire] += wire_weight
+
     
 
-    def _compute_local_lift(self):
-        # weight & velocity
-        self.body_tail_weight = 0.007*(self.span - 15.0)**2.0 + 14.0 if self.span > 15.0 else 14.0 #empirical estimation
-        self.empty_weight = self.wing_weight.sum()*2 + self.body_tail_weight
-        self.weight = self.pilot_weight + self.water_weight + self.empty_weight + self.payload
-        self.v_inf = np.sqrt(2*self.weight*self.gravity/(self.rho*self.wing_area*self.CL))
-        self.local_lift = np.hstack([0.5*self.rho*(self.v_inf**2)*(np.diff(self.y0)*self.span*0.5)*0.5*(self.local_cl[1:]*self.chord[1:] + self.local_cl[:-1]*self.chord[:-1]), 0.0]) #[N]
 
+        
+
+    def _compute_local_lift(self):
+        # 机身+尾翼重量经验估计
+        if self.span > 15.0:
+            self.body_tail_weight = 0.007*(self.span - 15.0)**2.0 + 14.0
+        else:
+            self.body_tail_weight = 14.0
+
+        # 总重
+        self.empty_weight = self.wing_weight.sum()*2.0 + self.body_tail_weight
+        self.weight = self.pilot_weight + self.water_weight + self.empty_weight + self.payload
+
+        # 平衡升力 => 巡航速度
+        self.v_inf = np.sqrt(
+            2.0*self.weight*self.gravity
+            /(self.rho*self.wing_area*self.CL)
+        )
+
+        # 局部升力分布（半翼）
+        self.local_lift = _local_lift_kernel(
+            self.y0,
+            self.local_cl,
+            self.chord,
+            self.rho,
+            self.v_inf,
+            self.span
+        )
+    # 注意: 这里 self.local_lift 和原来一样是 shape (n_struc,)
+    #       最后一项为0.0
 
     def _compute_power_aero(self):
-        # computation with aerodynamic (coarse) mesh points
-        # drag & power
-        # wing
-        self.re_aero = self.chord_aero*self.v_inf*self.rho/self.visc_mu
-        self.cd0_aero = self.cd0_interp(np.vstack([self.airfoil_aero, np.clip(self.re_aero, self.re_min, self.re_max), np.clip(self.aoa_aero, self.aoa_min, self.aoa_max)]).T)
-        self.CD0 = np.sum(0.5*(self.cd0_aero[1:]*self.chord_aero[1:] + self.cd0_aero[:-1]*self.chord_aero[1:])*np.abs(np.diff(self.y0_aero))*self.span*0.5)*2/self.wing_area
-        # tail
-        self.mac = 2.0/self.wing_area*np.sum((np.abs(np.diff(self.y0_aero))*self.span*0.5)*0.5*(self.chord_aero[1:]**2 + self.chord_aero[:-1]**2))
-        self.holizontal_tail_area = self.wing_area*self.mac*self.horisontal_tail_volume/self.horisontal_tail_arm
-        self.vertical_tail_area = self.wing_area*self.span*self.vertical_tail_volume/self.vertical_tail_arm
-        # aircraft
-        self.drag = (self.calibration_factor*(self.cdS_body + self.CD0*self.wing_area + self.cd_tail*(self.holizontal_tail_area + self.vertical_tail_area) + self.wire_cd*self.wire_length*self.wire_diameter) + self.CDi*self.wing_area)*0.5*self.rho*self.v_inf**2
-        self.CD = self.drag/(0.5*self.rho*self.wing_area*self.v_inf**2)
-        # power
-        self.power = self.drag*self.v_inf/self.drivetrain_efficiency
+        # 1. 雷诺数
+        self.re_aero = self.chord_aero * self.v_inf * self.rho / self.visc_mu
+
+        # 2. 剖面阻力系数 (需要 Python 侧插值器)
+        #    输入是 [airfoil, Re_clipped, aoa_clipped] per station
+        re_clip  = np.clip(self.re_aero, self.re_min, self.re_max)
+        aoa_clip = np.clip(self.aoa_aero, self.aoa_min, self.aoa_max)
+        # shape (N,3)
+        interp_input = np.vstack([self.airfoil_aero, re_clip, aoa_clip]).T
+        self.cd0_aero = self.cd0_interp(interp_input)
+
+        # 3. 机翼寄生阻力系数 CD0 (numba kernel)
+        self.CD0 = _integrate_CD0_kernel(
+            self.cd0_aero,
+            self.chord_aero,
+            self.y0_aero,
+            self.span,
+            self.wing_area
+        )
+
+        # 4. 平均气动弦长 mac (numba kernel)
+        self.mac = _compute_mac_kernel(
+            self.chord_aero,
+            self.y0_aero,
+            self.span,
+            self.wing_area
+        )
+
+        # 5. 尾翼面积 (标量公式)
+        self.holizontal_tail_area = (
+            self.wing_area * self.mac * self.horisontal_tail_volume / self.horisontal_tail_arm
+        )
+        self.vertical_tail_area = (
+            self.wing_area * self.span * self.vertical_tail_volume / self.vertical_tail_arm
+        )
+
+        # 6. 整机阻力
+        dyn_pressure = 0.5 * self.rho * (self.v_inf**2)
+        parasite_term = (
+            self.cdS_body
+            + self.CD0*self.wing_area
+            + self.cd_tail*(self.holizontal_tail_area + self.vertical_tail_area)
+            + self.wire_cd*self.wire_length*self.wire_diameter
+        )
+        self.drag = (self.calibration_factor*parasite_term + self.CDi*self.wing_area) * dyn_pressure
+
+        # 整机 CD
+        self.CD = self.drag / (dyn_pressure * self.wing_area)
+
+        # 7. 功率需求
+        self.power = self.drag * self.v_inf / self.drivetrain_efficiency
+
+        # 记录气动特性到表
         self.aero['re'] = self.re_aero
         self.aero['cd0'] = self.cd0_aero
+
+        # 8. 功率约束
         self.power_constraint = self.power - self.max_power
 
 
     def _compute_power(self):
-        # computation with structural (fine) mesh points 
-        # drag & power
-        # wing
-        self.re = self.chord*self.v_inf*self.rho/self.visc_mu
-        self.cd0 = self.cd0_interp(np.vstack([self.airfoil, np.clip(self.re, self.re_min, self.re_max), np.clip(self.aoa, self.aoa_min, self.aoa_max)]).T)
-        self.CD0 = np.sum(0.5*(self.cd0[1:]*self.chord[1:] + self.cd0[:-1]*self.chord[1:])*np.abs(np.diff(self.y0))*self.span*0.5)*2/self.wing_area
-        # tail
-        self.mac = 2.0/self.wing_area*np.sum((np.abs(np.diff(self.y0))*self.span*0.5)*0.5*(self.chord[1:]**2 + self.chord[:-1]**2))
-        self.holizontal_tail_area = self.wing_area*self.mac*self.horisontal_tail_volume/self.horisontal_tail_arm
-        self.vertical_tail_area = self.wing_area*self.span*self.vertical_tail_volume/self.vertical_tail_arm
-        # aircraft
-        self.drag = (self.calibration_factor*(self.cdS_body + self.CD0*self.wing_area + self.cd_tail*(self.holizontal_tail_area + self.vertical_tail_area) + self.wire_cd*self.wire_length*self.wire_diameter) + self.CDi*self.wing_area)*0.5*self.rho*self.v_inf**2
-        self.CD = self.drag/(0.5*self.rho*self.wing_area*self.v_inf**2)
-        # power
-        self.power = self.drag*self.v_inf/self.drivetrain_efficiency
+        # 1. 雷诺数 (细网格)
+        self.re = self.chord * self.v_inf * self.rho / self.visc_mu
+
+        # 2. 剖面阻力系数 (Python 插值)
+        re_clip  = np.clip(self.re, self.re_min, self.re_max)
+        aoa_clip = np.clip(self.aoa, self.aoa_min, self.aoa_max)
+        interp_input = np.vstack([self.airfoil, re_clip, aoa_clip]).T
+        self.cd0 = self.cd0_interp(interp_input)
+
+        # 3. CD0 via numba kernel
+        self.CD0 = _integrate_CD0_kernel(
+            self.cd0,
+            self.chord,
+            self.y0,
+            self.span,
+            self.wing_area
+        )
+
+        # 4. mac via numba kernel
+        self.mac = _compute_mac_kernel(
+            self.chord,
+            self.y0,
+            self.span,
+            self.wing_area
+        )
+
+        # 5. 尾翼面积
+        self.holizontal_tail_area = (
+            self.wing_area * self.mac * self.horisontal_tail_volume / self.horisontal_tail_arm
+        )
+        self.vertical_tail_area = (
+            self.wing_area * self.span * self.vertical_tail_volume / self.vertical_tail_arm
+        )
+
+        # 6. 整机阻力
+        dyn_pressure = 0.5 * self.rho * (self.v_inf**2)
+        parasite_term = (
+            self.cdS_body
+            + self.CD0*self.wing_area
+            + self.cd_tail*(self.holizontal_tail_area + self.vertical_tail_area)
+            + self.wire_cd*self.wire_length*self.wire_diameter
+        )
+        self.drag = (self.calibration_factor*parasite_term + self.CDi*self.wing_area) * dyn_pressure
+
+        # 整机 CD
+        self.CD = self.drag / (dyn_pressure * self.wing_area)
+
+        # 7. 功率需求
+        self.power = self.drag * self.v_inf / self.drivetrain_efficiency
+
+        # 8. 功率约束
         self.power_constraint = self.power - self.max_power
+
 
 
     def _stiffness(self):
@@ -632,21 +1021,31 @@ class HPADesigner():
         self.EA[-1] = self.EA[-2]
         self.GIp[-1] = self.GIp[-2]
 
-
+    
     def _compute_moment(self, y, F):
-        y, F = y[::-1], F[::-1]
-        return np.hstack([0.0, np.cumsum((np.cumsum(F)[:-1] + 0.5*F[1:])*np.abs(np.diff(y)))])[::-1]
+        """
+        JIT 加速版本的弯矩计算（无轴向力）。
+        现在直接调用 numba 编译过的 _compute_moment_jit 内核。
+        """
+        # 确保传给 numba 的是连续的 NumPy 数组（避免奇怪的 view 或 pandas index）
+        y_arr = np.asarray(y, dtype=np.float64)
+        F_arr = np.asarray(F, dtype=np.float64)
+
+        M = _compute_moment_jit(y_arr, F_arr)
+        return M
 
 
     def _compute_moment_with_axial_force(self, y, F, T, EI):
-        # beam-column theory
-        n = len(y)
-        M, S = np.zeros(n), np.zeros(n)
-        L = np.abs(np.diff(y))
-        for i in range(n-2, -1, -1):
-            TL_EI = T[i]*(0.5*L[i])**2/EI[i]
-            S[i] = (F[i] + (1 - TL_EI)*S[i+1] - T[i]*L[i]*M[i+1]/EI[i])/(1 + TL_EI)
-            M[i] = (0.5*L[i]*F[i] + (1 - TL_EI)*M[i+1] + L[i]*S[i+1])/(1 + TL_EI)
+        """
+        JIT 加速版本的弯矩/剪力计算（考虑轴向力）。
+        调用 numba 编译过的 _compute_moment_with_axial_force_jit。
+        """
+        y_arr  = np.asarray(y,  dtype=np.float64)
+        F_arr  = np.asarray(F,  dtype=np.float64)
+        T_arr  = np.asarray(T,  dtype=np.float64)
+        EI_arr = np.asarray(EI, dtype=np.float64)
+
+        M, S = _compute_moment_with_axial_force_jit(y_arr, F_arr, T_arr, EI_arr)
         return M, S
 
 
